@@ -163,18 +163,27 @@ export async function actionWait(params: {
   const sinceSeq = params.since_seq ?? proc.buffer.latestSeq();
 
   // If since_seconds_ago is provided, compute the equivalent seq
-  // by finding the first line with ts >= cutoff
+  // by finding the first line with ts >= cutoff in the full buffer
   let effectiveSinceSeq = sinceSeq;
   if (
     params.since_seconds_ago !== undefined &&
     params.since_seconds_ago > 0
   ) {
-    const cutoff = Date.now() - params.since_seconds_ago * 1000;
-    const firstInRange = proc.buffer
-      .getLines(undefined, params.since_seconds_ago, DEFAULT_MAX_LINES)
-      .find((l) => l.ts >= cutoff);
-    if (firstInRange) {
-      effectiveSinceSeq = firstInRange.seq - 1;
+    const seq = proc.buffer.firstSeqSince(params.since_seconds_ago);
+    if (seq !== undefined) {
+      effectiveSinceSeq = seq;
+    }
+  }
+
+  // Validate matchRegex before passing to waitForLine
+  if (params.matchRegex) {
+    try {
+      new RegExp(params.matchRegex, "i");
+    } catch {
+      return {
+        ok: false,
+        error: `Invalid regex pattern: "${params.matchRegex}". Check the syntax and try again.`,
+      };
     }
   }
 
@@ -209,7 +218,10 @@ export function actionInput(
   if (!proc.child || proc.exited) {
     return { ok: false, error: "process is not running." };
   }
-  proc.child.stdin?.write(text + "\n");
+  if (!proc.child.stdin) {
+    return { ok: false, error: "process stdin is not available (process was spawned without stdin)." };
+  }
+  proc.child.stdin.write(text + "\n");
   proc.buffer.push("system", `◀ stdin: ${text}`);
   return { ok: true, value: proc };
 }

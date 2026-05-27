@@ -9,7 +9,7 @@ export const SinceSeq = Type.Optional(
 export const SinceSecondsAgo = Type.Optional(
   Type.Number({
     description:
-      "Only return lines from the last N seconds. Mutually exclusive with since_seq.",
+      "Only return lines from the last N seconds. In watch_wait this overrides since_seq; in watch_output both filters are combined (AND).",
   }),
 );
 
@@ -90,8 +90,9 @@ export const WatchWaitSchema = Type.Object({
   ),
   matchRegex: Type.Optional(
     Type.String({
+      minLength: 1,
       description:
-        "Regex pattern to wait for (case-insensitive). Use for anchored matches like ^Test Files. Mutually orthogonal with match — both can be combined.",
+        "Regex pattern to wait for (case-insensitive). Use for anchored matches like ^Test Files. Mutually orthogonal with match — both can be combined. Invalid regex patterns return an error.",
     }),
   ),
   sources: Type.Optional(

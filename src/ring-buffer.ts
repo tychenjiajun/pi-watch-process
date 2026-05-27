@@ -54,6 +54,17 @@ export class RingBuffer {
     return this.seq;
   }
 
+  /**
+   * Find the sequence number of the first line within the last N seconds.
+   * Returns (seq - 1) so it can be used as effectiveSinceSeq directly.
+   * Searches the entire buffer without a line limit (unlike getLines).
+   */
+  firstSeqSince(sinceSecondsAgo: number): number | undefined {
+    const cutoff = Date.now() - sinceSecondsAgo * 1000;
+    const first = this.lines.find((l) => l.ts >= cutoff);
+    return first ? first.seq - 1 : undefined;
+  }
+
   latestTs(): number | undefined {
     return this.lines.length > 0
       ? this.lines[this.lines.length - 1].ts
