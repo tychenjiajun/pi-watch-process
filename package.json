@@ -18,6 +18,7 @@
   "license": "MIT",
   "files": [
     "*.ts",
+    "src/",
     "README.md",
     "README_zh-CN.md"
   ],
