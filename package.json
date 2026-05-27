@@ -1,0 +1,37 @@
+{
+  "name": "pi-watch",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Pi extension to manage CLI watch-mode processes (tsc --watch, jest --watch, etc.)",
+  "main": "index.ts",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "watch",
+    "build-watcher",
+    "tsc",
+    "jest"
+  ],
+  "license": "MIT",
+  "files": [
+    "*.ts",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@sinclair/typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "~0.75.0",
+    "@sinclair/typebox": "^0.34.49",
+    "typescript": "^6.0.3"
+  }
+}
