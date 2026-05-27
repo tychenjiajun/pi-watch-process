@@ -1,53 +1,50 @@
-# pi-watch
+# pi-watch-process
 
-Pi extension to manage CLI watch-mode processes (tsc --watch, jest --watch, etc.).
+Pi extension for managing CLI watch-mode processes. Start, monitor, and control long-running commands like `tsc --watch`, `jest --watch`, or `cargo watch` directly from the LLM.
 
-## Install
+## Installation
 
-Place in `~/.pi/agent/extensions/` or `.pi/extensions/`, or use `--extension`:
+Place in auto-discovery location or use `--extension`:
 
 ```bash
 # Quick test
-pi -e /path/to/watch-mcp/index.ts
+pi -e /path/to/pi-watch-process/index.ts
 
 # Global install
-ln -s ~/projects/watch-mcp ~/.pi/agent/extensions/watch
+ln -s ~/projects/pi-watch-process ~/.pi/agent/extensions/watch-process
 
 # Project-local
 mkdir -p .pi/extensions
-ln -s ~/projects/watch-mcp .pi/extensions/watch
+ln -s ~/projects/pi-watch-process .pi/extensions/watch-process
 ```
 
-Or as a pi package in `settings.json`:
+Or configure via `settings.json`:
 
 ```json
 {
-  "extensions": ["/path/to/watch-mcp"]
+  "extensions": ["/path/to/pi-watch-process"]
 }
 ```
 
 ## Usage
 
-Once loaded, the extension registers 7 tools that the LLM can use to manage long-running CLI processes.
+Once loaded, 7 tools are available to the LLM:
 
-### Tools
+| Tool | Description | Key Parameters |
+|------|-------------|----------------|
+| `watch_start` | Start a process | `{command, args[], cwd?, name?}` |
+| `watch_stop` | Stop a process by ID or name | `{process}` |
+| `watch_list` | List all running processes | — |
+| `watch_status` | Get detailed status of one process | `{process}` |
+| `watch_output` | Get recent output | `{process, since_seq?, since_seconds_ago?, limit?}` |
+| `watch_wait` | Block until new output/match | `{process, since_seq?, since_seconds_ago?, timeout_ms?, match?}` |
+| `watch_input` | Send text to stdin | `{process, text}` |
 
-| Tool | Description |
-|------|-------------|
-| `watch_start` | Start a process with `{command, args[], cwd?, name?}` |
-| `watch_stop` | Stop a process by ID or name |
-| `watch_list` | List all running processes |
-| `watch_status` | Get detailed status of one process |
-| `watch_output` | Get recent output (with `since_seq` or `since_seconds_ago`) |
-| `watch_wait` | Block until new output/match arrives |
-| `watch_input` | Send text to stdin |
-
-### Example workflow
+### Example Workflow
 
 **1. Start a TypeScript watcher:**
 
 ```typescript
-// LLM calls:
 {
   "name": "watch_start",
   "arguments": {
@@ -57,11 +54,7 @@ Once loaded, the extension registers 7 tools that the LLM can use to manage long
     "name": "tsc"
   }
 }
-
-// Returns:
-Started process proc_1 (tsc). PID: 12345
-Command: tsc --watch
-CWD: /path/to/project
+// → Started process proc_1 (tsc). PID: 12345
 ```
 
 **2. Wait for compilation to finish:**
@@ -77,7 +70,7 @@ CWD: /path/to/project
 }
 ```
 
-**3. Check incremental output:**
+**3. Get incremental output (polling):**
 
 ```typescript
 {
@@ -90,7 +83,19 @@ CWD: /path/to/project
 }
 ```
 
-**4. View all processes:**
+**4. Get output from the last 60 seconds:**
+
+```typescript
+{
+  "name": "watch_output",
+  "arguments": {
+    "process": "proc_1",
+    "since_seconds_ago": 60
+  }
+}
+```
+
+**5. View all processes:**
 
 ```typescript
 {
@@ -100,22 +105,23 @@ CWD: /path/to/project
 
 ## Features
 
-- **Multiple processes**: Run several watchers simultaneously (tsc + jest + cargo watch, etc.)
-- **Ring buffer**: 500-line rolling buffer with seq numbers and timestamps
+- **Multiple processes**: Run several watchers simultaneously (e.g., tsc + jest + cargo watch)
+- **Flexible identification**: Reference processes by auto-generated ID (`proc_1`) or human-readable name (`tsc`)
+- **Ring buffer**: 500-line rolling buffer with sequence numbers and timestamps
 - **Flexible queries**: Use `since_seq` for polling or `since_seconds_ago` for time-based queries
 - **Blocking wait**: `watch_wait` blocks with optional substring matching (ideal for "wait for build to finish")
 - **Stdin support**: Send input to interactive prompts via `watch_input`
 - **No persistence**: All processes are killed on session shutdown (fresh start each time)
-- **Abort-safe**: `watch_wait` honors the agent abort signal (Esc cancels)
+- **Abort-safe**: `watch_wait` honors the agent abort signal (Esc cancels the wait)
+- **ANSI stripping**: Output is automatically cleaned of terminal escape codes
+- **Source tagging**: Each line is tagged as `stdout`, `stderr`, or `system`
 
-## Differences from original watch-mcp
+## Technical Details
 
-The original `index.js` was an MCP server using `@modelcontextprotocol/sdk`. This extension:
-
-- Is native to pi (no MCP protocol layer)
-- Supports multiple concurrent processes
-- Uses pi's tool calling interface directly
-- Follows pi-headless-subagent patterns (state management, cleanup on shutdown)
+- No build required — TypeScript compiled on-the-fly via jiti
+- Follows patterns from `pi-headless-subagent` (state management, cleanup on shutdown)
+- Peer dependencies: `@earendil-works/pi-coding-agent`, `@sinclair/typebox`
+- Pure Node.js implementation using `child_process.spawn` and `EventEmitter`
 
 ## License
 
