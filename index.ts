@@ -306,6 +306,273 @@ export default function (pi: ExtensionAPI) {
     await killAll("Session shutting down");
   });
 
+  // ─── Slash Commands ────────────────────────────────────────────────────────
+
+  pi.registerCommand("watch-start", {
+    description: "Start a CLI watch-mode process",
+    handler: async (args, ctx) => {
+      const parts = args.trim().split(/\s+/);
+      if (parts.length === 0 || parts[0] === "") {
+        ctx.ui.notify("Usage: /watch-start <command> [args...] [--name <name>]", "error");
+        return;
+      }
+
+      // Parse --name flag
+      let name: string | undefined;
+      const nameIdx = parts.indexOf("--name");
+      if (nameIdx >= 0 && nameIdx + 1 < parts.length) {
+        name = parts[nameIdx + 1];
+        parts.splice(nameIdx, 2);
+      }
+
+      const command = parts[0];
+      const rest = parts.slice(1);
+
+      // Check for duplicate name
+      if (name) {
+        const existing = resolveProcess(name);
+        if (existing && existing.name === name) {
+          ctx.ui.notify(`Name "${name}" already used by ${existing.id}`, "error");
+          return;
+        }
+      }
+
+      const id = createId();
+      const proc: WatchProcess = {
+        id,
+        name,
+        command,
+        args: rest,
+        cwd: ctx.cwd,
+        child: undefined,
+        exited: false,
+        startTime: 0,
+        buffer: new RingBuffer(),
+      };
+
+      processes.set(id, proc);
+      startProcess(proc);
+
+      ctx.ui.notify(`Started ${id} (${name ?? command}). PID: ${proc.child?.pid ?? "n/a"}`, "info");
+    },
+  });
+
+  pi.registerCommand("watch-stop", {
+    description: "Stop a watch process by ID or name",
+    getArgumentCompletions: (prefix) => {
+      const items = [...processes.values()].filter((p) => !p.exited).map((p) => ({
+        value: p.id,
+        label: p.name ? `${p.id} (${p.name})` : p.id,
+      }));
+      if (prefix) {
+        return items.filter((i) => i.value.startsWith(prefix) || i.label.toLowerCase().includes(prefix.toLowerCase()));
+      }
+      return items.length > 0 ? items : null;
+    },
+    handler: async (args, ctx) => {
+      const ref = args.trim();
+      if (!ref) {
+        ctx.ui.notify("Usage: /watch-stop <process-id-or-name>", "error");
+        return;
+      }
+      const proc = resolveProcess(ref);
+      if (!proc) {
+        ctx.ui.notify(`No process found for "${ref}"`, "error");
+        return;
+      }
+      await stopProcess(proc);
+      ctx.ui.notify(`Stopped ${proc.id} (${proc.name ?? proc.command})`, "info");
+    },
+  });
+
+  pi.registerCommand("watch-list", {
+    description: "List all running watch processes",
+    handler: async (_args, ctx) => {
+      const list = [...processes.values()];
+      if (list.length === 0) {
+        ctx.ui.notify("No watch processes running", "info");
+        return;
+      }
+      const lines = list.map(formatProcessSummary);
+      ctx.ui.setWidget("watch-list", lines, { placement: "belowEditor" });
+      ctx.ui.notify(`${list.length} process(es) running`, "info");
+    },
+  });
+
+  pi.registerCommand("watch-status", {
+    description: "Show detailed status of a watch process",
+    getArgumentCompletions: (prefix) => {
+      const items = [...processes.values()].filter((p) => !p.exited).map((p) => ({
+        value: p.id,
+        label: p.name ? `${p.id} (${p.name})` : p.id,
+      }));
+      if (prefix) {
+        return items.filter((i) => i.value.startsWith(prefix) || i.label.toLowerCase().includes(prefix.toLowerCase()));
+      }
+      return items.length > 0 ? items : null;
+    },
+    handler: async (args, ctx) => {
+      const ref = args.trim();
+      if (!ref) {
+        ctx.ui.notify("Usage: /watch-status <process-id-or-name>", "error");
+        return;
+      }
+      const proc = resolveProcess(ref);
+      if (!proc) {
+        ctx.ui.notify(`No process found for "${ref}"`, "error");
+        return;
+      }
+      ctx.ui.notify(formatProcessStatus(proc), "info");
+    },
+  });
+
+  pi.registerCommand("watch-output", {
+    description: "Show recent output from a watch process",
+    getArgumentCompletions: (prefix) => {
+      const items = [...processes.values()].filter((p) => !p.exited).map((p) => ({
+        value: p.id,
+        label: p.name ? `${p.id} (${p.name})` : p.id,
+      }));
+      if (prefix) {
+        return items.filter((i) => i.value.startsWith(prefix) || i.label.toLowerCase().includes(prefix.toLowerCase()));
+      }
+      return items.length > 0 ? items : null;
+    },
+    handler: async (args, ctx) => {
+      const parts = args.trim().split(/\s+/);
+      if (parts.length === 0 || parts[0] === "") {
+        ctx.ui.notify("Usage: /watch-output <process> [--since <seq|seconds>] [--limit <n>]", "error");
+        return;
+      }
+
+      const ref = parts[0];
+      const proc = resolveProcess(ref);
+      if (!proc) {
+        ctx.ui.notify(`No process found for "${ref}"`, "error");
+        return;
+      }
+
+      let sinceSeq: number | undefined;
+      let sinceSecondsAgo: number | undefined;
+      let limit = 50;
+
+      for (let i = 1; i < parts.length; i++) {
+        if (parts[i] === "--since" && i + 1 < parts.length) {
+          const val = parts[i + 1];
+          if (val.endsWith("s")) {
+            sinceSecondsAgo = parseInt(val.slice(0, -1), 10);
+          } else {
+            sinceSeq = parseInt(val, 10);
+          }
+          i++;
+        } else if (parts[i] === "--limit" && i + 1 < parts.length) {
+          limit = parseInt(parts[i + 1], 10);
+          i++;
+        }
+      }
+
+      const slice = proc.buffer.getLines(sinceSeq, sinceSecondsAgo, limit);
+      if (slice.length === 0) {
+        ctx.ui.notify("(no output)", "info");
+        return;
+      }
+
+      const text = slice.map(formatLine).join("\n");
+      ctx.ui.setWidget(`watch-output-${proc.id}`, [text], { placement: "belowEditor" });
+    },
+  });
+
+  pi.registerCommand("watch-wait", {
+    description: "Wait for new output from a watch process (optionally matching a substring)",
+    getArgumentCompletions: (prefix) => {
+      const items = [...processes.values()].filter((p) => !p.exited).map((p) => ({
+        value: p.id,
+        label: p.name ? `${p.id} (${p.name})` : p.id,
+      }));
+      if (prefix) {
+        return items.filter((i) => i.value.startsWith(prefix) || i.label.toLowerCase().includes(prefix.toLowerCase()));
+      }
+      return items.length > 0 ? items : null;
+    },
+    handler: async (args, ctx) => {
+      const parts = args.trim().split(/\s+/);
+      if (parts.length === 0 || parts[0] === "") {
+        ctx.ui.notify("Usage: /watch-wait <process> [--match <text>] [--timeout <ms>]", "error");
+        return;
+      }
+
+      const ref = parts[0];
+      const proc = resolveProcess(ref);
+      if (!proc) {
+        ctx.ui.notify(`No process found for "${ref}"`, "error");
+        return;
+      }
+
+      let match: string | undefined;
+      let timeout = 15000;
+
+      for (let i = 1; i < parts.length; i++) {
+        if (parts[i] === "--match" && i + 1 < parts.length) {
+          match = parts[i + 1];
+          i++;
+        } else if (parts[i] === "--timeout" && i + 1 < parts.length) {
+          timeout = Math.min(parseInt(parts[i + 1], 10), 60000);
+          i++;
+        }
+      }
+
+      const sinceSeq = proc.buffer.latestSeq();
+      ctx.ui.notify(`Waiting for output${match ? ` matching "${match}"` : ""}...`, "info");
+
+      const collected = await proc.buffer.waitForLine(sinceSeq, timeout, match);
+
+      if (collected.length === 0) {
+        ctx.ui.notify("(timeout — no new output)", "info");
+      } else {
+        const text = collected.map(formatLine).join("\n");
+        ctx.ui.setWidget(`watch-wait-${proc.id}`, [text], { placement: "belowEditor" });
+      }
+    },
+  });
+
+  pi.registerCommand("watch-input", {
+    description: "Send text to a watch process's stdin",
+    getArgumentCompletions: (prefix) => {
+      const items = [...processes.values()].filter((p) => !p.exited).map((p) => ({
+        value: p.id,
+        label: p.name ? `${p.id} (${p.name})` : p.id,
+      }));
+      if (prefix) {
+        return items.filter((i) => i.value.startsWith(prefix) || i.label.toLowerCase().includes(prefix.toLowerCase()));
+      }
+      return items.length > 0 ? items : null;
+    },
+    handler: async (args, ctx) => {
+      const parts = args.trim().split(/\s+/);
+      if (parts.length < 2 || parts[0] === "") {
+        ctx.ui.notify("Usage: /watch-input <process> <text>", "error");
+        return;
+      }
+
+      const ref = parts[0];
+      const proc = resolveProcess(ref);
+      if (!proc) {
+        ctx.ui.notify(`No process found for "${ref}"`, "error");
+        return;
+      }
+      if (!proc.child || proc.exited) {
+        ctx.ui.notify("Process is not running", "error");
+        return;
+      }
+
+      const text = parts.slice(1).join(" ");
+      proc.child.stdin?.write(text + "\n");
+      proc.buffer.push("system", `◀ stdin: ${text}`);
+      ctx.ui.notify(`Sent to ${proc.id}: ${text}`, "info");
+    },
+  });
+
+  // ─── Tools ─────────────────────────────────────────────────────────────────
   pi.registerTool(
     defineTool({
       name: "watch_start",

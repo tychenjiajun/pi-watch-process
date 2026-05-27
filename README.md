@@ -28,7 +28,29 @@ Or configure via `settings.json`:
 
 ## Usage
 
-Once loaded, 7 tools are available to the LLM:
+Once loaded, 7 tools are available to the LLM, plus 7 slash commands for manual control:
+
+## Slash Commands (Manual Control)
+
+| Command | Description | Example |
+|---------|-------------|----------|
+| `/watch-start` | Start a process | `/watch-start tsc --watch --name tsc` |
+| `/watch-stop` | Stop a process | `/watch-stop proc_1` |
+| `/watch-list` | List all processes | `/watch-list` |
+| `/watch-status` | Show detailed status | `/watch-status proc_1` |
+| `/watch-output` | Show recent output | `/watch-output proc_1 --since 100 --limit 50` |
+| `/watch-wait` | Wait for new output | `/watch-wait proc_1 --match "error" --timeout 30000` |
+| `/watch-input` | Send text to stdin | `/watch-input proc_1 q` |
+
+### Command Options
+
+- `--name <name>`: Assign a human-readable name to a process
+- `--since <seq|seconds>`: Filter output by sequence number or time (e.g., `100` or `60s`)
+- `--limit <n>`: Limit output lines (default 50)
+- `--match <text>`: Wait for output containing text (case-insensitive)
+- `--timeout <ms>`: Maximum wait time in milliseconds (default 15000, max 60000)
+
+## LLM Tools
 
 | Tool | Description | Key Parameters |
 |------|-------------|----------------|

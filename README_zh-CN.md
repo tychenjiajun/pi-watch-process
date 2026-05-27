@@ -28,7 +28,29 @@ ln -s ~/projects/pi-watch-process .pi/extensions/watch-process
 
 ## 使用
 
-加载后，LLM 可以使用以下 7 个工具：
+加载后，LLM 可以使用以下 7 个工具，另外还有 7 个斜杠命令用于手动控制：
+
+## 斜杠命令（手动控制）
+
+| 命令 | 描述 | 示例 |
+|------|------|------|
+| `/watch-start` | 启动一个进程 | `/watch-start tsc --watch --name tsc` |
+| `/watch-stop` | 停止一个进程 | `/watch-stop proc_1` |
+| `/watch-list` | 列出所有进程 | `/watch-list` |
+| `/watch-status` | 显示详细状态 | `/watch-status proc_1` |
+| `/watch-output` | 显示最近输出 | `/watch-output proc_1 --since 100 --limit 50` |
+| `/watch-wait` | 等待新输出 | `/watch-wait proc_1 --match "error" --timeout 30000` |
+| `/watch-input` | 向 stdin 发送文本 | `/watch-input proc_1 q` |
+
+### 命令选项
+
+- `--name <name>`：为进程分配一个易读的名称
+- `--since <seq|seconds>`：按序列号或时间过滤输出（例如 `100` 或 `60s`）
+- `--limit <n>`：限制输出行数（默认 50）
+- `--match <text>`：等待包含指定文本的输出（不区分大小写）
+- `--timeout <ms>`：最大等待时间（毫秒）（默认 15000，最大 60000）
+
+## LLM 工具
 
 | 工具 | 描述 | 主要参数 |
 |------|------|----------|
