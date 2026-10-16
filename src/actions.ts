@@ -1,4 +1,9 @@
-import { RingBuffer, DEFAULT_MAX_LINES, type LineSource } from "./ring-buffer.js";
+import {
+  RingBuffer,
+  DEFAULT_MAX_LINES,
+  type BufferedLine,
+  type LineSource,
+} from "./ring-buffer.js";
 import {
   processes,
   createId,
@@ -8,7 +13,6 @@ import {
   stopProcess,
   type WatchProcess,
 } from "./process.js";
-import { formatLine, formatProcessSummary } from "./format.js";
 
 // ─── Result type ─────────────────────────────────────────────────────────────
 
@@ -74,7 +78,9 @@ export function actionStart(params: {
   return { ok: true, value: proc };
 }
 
-export async function actionStop(ref: string): Promise<Result<WatchProcess>> {
+export async function actionStop(
+  ref: string,
+): Promise<Result<{ process: WatchProcess; wasRunning: boolean }>> {
   pruneStopped();
   const proc = resolveProcess(ref);
   if (!proc) {
@@ -83,13 +89,41 @@ export async function actionStop(ref: string): Promise<Result<WatchProcess>> {
       error: `no process found for "${ref}". Use watch_list to see available processes.`,
     };
   }
+  const wasRunning = !proc.exited;
   await stopProcess(proc);
+  return { ok: true, value: { process: proc, wasRunning } };
+}
+
+/**
+ * Hot-restart a process in place: stop it, keep the same id/name/buffer, then
+ * spawn it again. This is the HMR primitive of the harness — after editing a
+ * watched config or when a watcher wedges, restart it without losing its
+ * history or identity.
+ */
+export async function actionRestart(ref: string): Promise<Result<WatchProcess>> {
+  pruneStopped();
+  const proc = resolveProcess(ref);
+  if (!proc) {
+    return {
+      ok: false,
+      error: `no process found for "${ref}". Use watch_list to see available processes.`,
+    };
+  }
+
+  await stopProcess(proc);
+
+  const ok = startProcess(proc);
+  if (!ok) {
+    return {
+      ok: false,
+      error: `command "${proc.resolvedPath}" could not be restarted — it is no longer reachable in node_modules/.bin or PATH.`,
+    };
+  }
+
   return { ok: true, value: proc };
 }
 
-export function actionList(
-  includeCompleted: boolean,
-): WatchProcess[] {
+export function actionList(includeCompleted: boolean): WatchProcess[] {
   pruneStopped();
   const all = [...processes.values()];
   return includeCompleted ? all : all.filter((p) => !p.exited);
@@ -106,13 +140,19 @@ export function actionStatus(ref: string): Result<WatchProcess> {
   return { ok: true, value: proc };
 }
 
+export interface OutputSlice {
+  empty: boolean;
+  lines: BufferedLine[];
+  process: WatchProcess;
+}
+
 export function actionOutput(params: {
   process: string;
   since_seq?: number;
   since_seconds_ago?: number;
   limit?: number;
   sources?: LineSource[];
-}): Result<{ empty: boolean; lines: string; process: WatchProcess }> {
+}): Result<OutputSlice> {
   const proc = resolveProcess(params.process);
   if (!proc) {
     return {
@@ -130,15 +170,13 @@ export function actionOutput(params: {
 
   return {
     ok: true,
-    value: {
-      empty: slice.length === 0,
-      lines:
-        slice.length === 0
-          ? "(no new output)"
-          : slice.map(formatLine).join("\n"),
-      process: proc,
-    },
+    value: { empty: slice.length === 0, lines: slice, process: proc },
   };
+}
+
+export interface WaitSlice extends OutputSlice {
+  matched: boolean;
+  timedOut: boolean;
 }
 
 export async function actionWait(params: {
@@ -150,7 +188,7 @@ export async function actionWait(params: {
   matchRegex?: string;
   sources?: LineSource[];
   signal?: AbortSignal;
-}): Promise<Result<{ empty: boolean; lines: string; process: WatchProcess }>> {
+}): Promise<Result<WaitSlice>> {
   const proc = resolveProcess(params.process);
   if (!proc) {
     return {
@@ -165,10 +203,7 @@ export async function actionWait(params: {
   // If since_seconds_ago is provided, compute the equivalent seq
   // by finding the first line with ts >= cutoff in the full buffer
   let effectiveSinceSeq = sinceSeq;
-  if (
-    params.since_seconds_ago !== undefined &&
-    params.since_seconds_ago > 0
-  ) {
+  if (params.since_seconds_ago !== undefined && params.since_seconds_ago > 0) {
     const seq = proc.buffer.firstSeqSince(params.since_seconds_ago);
     if (seq !== undefined) {
       effectiveSinceSeq = seq;
@@ -187,7 +222,7 @@ export async function actionWait(params: {
     }
   }
 
-  const collected = await proc.buffer.waitForLine(
+  const result = await proc.buffer.waitForLine(
     effectiveSinceSeq,
     timeout,
     params.match,
@@ -196,12 +231,16 @@ export async function actionWait(params: {
     params.sources,
   );
 
-  const empty = collected.length === 0;
-  const lines = empty
-    ? "(timeout — no new output)"
-    : collected.map(formatLine).join("\n");
-
-  return { ok: true, value: { empty, lines, process: proc } };
+  return {
+    ok: true,
+    value: {
+      empty: result.lines.length === 0,
+      lines: result.lines,
+      process: proc,
+      matched: result.matched,
+      timedOut: result.timedOut,
+    },
+  };
 }
 
 export function actionInput(
@@ -219,7 +258,10 @@ export function actionInput(
     return { ok: false, error: "process is not running." };
   }
   if (!proc.child.stdin) {
-    return { ok: false, error: "process stdin is not available (process was spawned without stdin)." };
+    return {
+      ok: false,
+      error: "process stdin is not available (process was spawned without stdin).",
+    };
   }
   proc.child.stdin.write(text + "\n");
   proc.buffer.push("system", `◀ stdin: ${text}`);

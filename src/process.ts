@@ -20,12 +20,32 @@ export interface WatchProcess {
 }
 
 // ─── Process registry ────────────────────────────────────────────────────────
+//
+// The registry lives on `globalThis`, not in module scope, so it survives hot
+// module replacement (`/reload`): the freshly loaded extension module adopts the
+// still-running child processes and their ring buffers instead of leaking them
+// or starting from zero. The `data`/`close` handlers attached to each child by
+// the previous runtime keep writing into these same buffers.
 
-export const processes = new Map<string, WatchProcess>();
+interface WatchRegistry {
+  processes: Map<string, WatchProcess>;
+  nextProcNum: number;
+}
 
-let nextProcNum = 1;
+const REGISTRY_KEY = Symbol.for("pi-watch-process.registry.v1");
 
-export const createId = (): string => `proc_${nextProcNum++}`;
+const globalStore = globalThis as unknown as Record<symbol, WatchRegistry | undefined>;
+
+const registry: WatchRegistry =
+  globalStore[REGISTRY_KEY] ??
+  (globalStore[REGISTRY_KEY] = {
+    processes: new Map<string, WatchProcess>(),
+    nextProcNum: 1,
+  });
+
+export const processes = registry.processes;
+
+export const createId = (): string => `proc_${registry.nextProcNum++}`;
 
 export const PRUNE_AGE_MS = 5 * 60 * 1000;
 
@@ -151,6 +171,24 @@ export async function killAll(): Promise<void> {
   await Promise.allSettled(
     [...processes.values()].map((proc) => stopProcess(proc)),
   );
+}
+
+/**
+ * Detach pending `watch_wait` listeners from every ring buffer while leaving
+ * the child processes running. Called on hot module replacement so the next
+ * runtime starts with a clean event bus but keeps the live processes.
+ */
+export function detachAllWaiters(): void {
+  for (const proc of processes.values()) {
+    proc.buffer.clearListeners();
+  }
+}
+
+/** Number of processes that are still running. */
+export function runningCount(): number {
+  let n = 0;
+  for (const proc of processes.values()) if (!proc.exited) n++;
+  return n;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

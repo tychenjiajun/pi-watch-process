@@ -1,15 +1,25 @@
 /**
  * watch — Pi extension to manage CLI watch-mode processes
  *
- * Start, monitor, and control long-running CLI processes (tsc --watch,
- * jest --watch, cargo watch, etc.) directly from pi's LLM tool calls.
+ * Start, monitor, control, and hot-restart long-running CLI processes
+ * (tsc --watch, jest --watch, cargo watch, etc.) from pi's LLM tool calls or
+ * from codemode scripts.
+ *
+ * Every tool declares an `outputSchema` and returns `structuredContent`, so
+ * codemode scripts receive data instead of parsing text. The process registry
+ * lives on `globalThis`, so `/reload` (hot module replacement) keeps running
+ * children and their buffers alive instead of leaking or dropping them.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+  AgentToolResult,
+  ExtensionAPI,
+} from "@earendil-works/pi-coding-agent";
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import {
   actionStart,
   actionStop,
+  actionRestart,
   actionList,
   actionStatus,
   actionOutput,
@@ -19,321 +29,78 @@ import {
 import {
   WatchStartSchema,
   WatchStopSchema,
+  WatchRestartSchema,
   WatchListSchema,
   WatchStatusSchema,
   WatchOutputSchema,
   WatchWaitSchema,
   WatchInputSchema,
+  WatchStartOutputSchema,
+  WatchStopOutputSchema,
+  WatchRestartOutputSchema,
+  WatchListOutputSchema,
+  WatchStatusOutputSchema,
+  WatchOutputOutputSchema,
+  WatchWaitOutputSchema,
+  WatchInputOutputSchema,
 } from "./src/schemas.js";
-import { formatProcessSummary, formatProcessStatus } from "./src/format.js";
-import { killAll, processes, type WatchProcess } from "./src/process.js";
+import {
+  formatLine,
+  formatProcessSummary,
+  formatProcessStatus,
+  toLineJson,
+  toProcessSummary,
+} from "./src/format.js";
+import {
+  killAll,
+  detachAllWaiters,
+  type WatchProcess,
+} from "./src/process.js";
+
+// ─── Shared constants / helpers ──────────────────────────────────────────────
+
+const WATCH_NAMESPACE = {
+  name: "watch",
+  description:
+    "Long-running CLI watch-mode processes (build/test/lint watchers). Processes are addressed by id or name.",
+} as const;
+
+const READ_ONLY = { readOnlyHint: true, openWorldHint: true } as const;
+const MUTATING = { readOnlyHint: false, openWorldHint: true } as const;
+const DESTRUCTIVE = { readOnlyHint: false, destructiveHint: true } as const;
+
+type Structured = AgentToolResult<unknown>["structuredContent"];
+
+/** Model-facing text plus matching `structuredContent` for codemode scripts. */
+const okResult = (
+  text: string,
+  structuredContent: unknown,
+): AgentToolResult<unknown> => ({
+  content: [{ type: "text", text }],
+  details: {},
+  structuredContent: structuredContent as Structured,
+});
+
+/** Failure that still carries `{ ok: false, error }` for codemode scripts. */
+const failResult = (error: string): AgentToolResult<unknown> => ({
+  content: [{ type: "text", text: `Error: ${error}` }],
+  details: {},
+  structuredContent: { ok: false, error } as Structured,
+  isError: true,
+});
 
 // ─── Extension ────────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-  pi.on("session_shutdown", async () => {
+  // HMR: on `/reload`, keep the child processes running and only detach the
+  // previous runtime's waiters. The global registry lets the next runtime adopt
+  // them. On any other shutdown (quit, new/resume/fork), stop everything.
+  pi.on("session_shutdown", async (event) => {
+    if (event.reason === "reload") {
+      detachAllWaiters();
+      return;
+    }
     await killAll();
-  });
-
-  // ─── Slash Commands ────────────────────────────────────────────────────────
-
-  pi.registerCommand("watch-start", {
-    description: "Start a CLI watch-mode process",
-    handler: async (args, ctx) => {
-      const parts = args.trim().split(/\s+/);
-      if (parts.length === 0 || parts[0] === "") {
-        ctx.ui.notify(
-          "Usage: /watch-start <command> [args...] [--name <name>]",
-          "error",
-        );
-        return;
-      }
-
-      // Parse --name flag
-      let name: string | undefined;
-      const nameIdx = parts.indexOf("--name");
-      if (nameIdx >= 0 && nameIdx + 1 < parts.length) {
-        name = parts[nameIdx + 1];
-        parts.splice(nameIdx, 2);
-      }
-
-      const command = parts[0];
-      const rest = parts.slice(1);
-
-      const result = actionStart({ command, args: rest, cwd: ctx.cwd, name });
-
-      if (!result.ok) {
-        ctx.ui.notify(result.error, "error");
-      } else {
-        const proc = result.value;
-        ctx.ui.notify(
-          `Started ${proc.id} (${name ?? command}). PID: ${proc.child?.pid ?? "n/a"}`,
-          "info",
-        );
-      }
-    },
-  });
-
-  pi.registerCommand("watch-stop", {
-    description: "Stop a watch process by ID or name",
-    getArgumentCompletions: (prefix) => {
-      const items = [...processes.values()]
-        .filter((p) => !p.exited)
-        .map((p) => ({
-          value: p.id,
-          label: p.name ? `${p.id} (${p.name})` : p.id,
-        }));
-      if (prefix) {
-        return items.filter(
-          (i) =>
-            i.value.startsWith(prefix) ||
-            i.label.toLowerCase().includes(prefix.toLowerCase()),
-        );
-      }
-      return items.length > 0 ? items : null;
-    },
-    handler: async (args, ctx) => {
-      const ref = args.trim();
-      if (!ref) {
-        ctx.ui.notify(
-          "Usage: /watch-stop <process-id-or-name>",
-          "error",
-        );
-        return;
-      }
-      const result = await actionStop(ref);
-      if (!result.ok) {
-        ctx.ui.notify(result.error, "error");
-      } else {
-        const proc = result.value;
-        ctx.ui.notify(
-          `Stopped ${proc.id} (${proc.name ?? proc.command})`,
-          "info",
-        );
-      }
-    },
-  });
-
-  pi.registerCommand("watch-list", {
-    description: "List all running watch processes",
-    handler: async (_args, ctx) => {
-      const list = actionList(false);
-      if (list.length === 0) {
-        ctx.ui.notify("No watch processes running", "info");
-        return;
-      }
-      const lines = list.map(formatProcessSummary);
-      ctx.ui.setWidget("watch-list", lines, { placement: "belowEditor" });
-      ctx.ui.notify(`${list.length} process(es) running`, "info");
-    },
-  });
-
-  pi.registerCommand("watch-status", {
-    description: "Show detailed status of a watch process",
-    getArgumentCompletions: (prefix) => {
-      const items = [...processes.values()]
-        .filter((p) => !p.exited)
-        .map((p) => ({
-          value: p.id,
-          label: p.name ? `${p.id} (${p.name})` : p.id,
-        }));
-      if (prefix) {
-        return items.filter(
-          (i) =>
-            i.value.startsWith(prefix) ||
-            i.label.toLowerCase().includes(prefix.toLowerCase()),
-        );
-      }
-      return items.length > 0 ? items : null;
-    },
-    handler: async (args, ctx) => {
-      const ref = args.trim();
-      if (!ref) {
-        ctx.ui.notify(
-          "Usage: /watch-status <process-id-or-name>",
-          "error",
-        );
-        return;
-      }
-      const result = actionStatus(ref);
-      if (!result.ok) {
-        ctx.ui.notify(result.error, "error");
-      } else {
-        ctx.ui.notify(formatProcessStatus(result.value), "info");
-      }
-    },
-  });
-
-  pi.registerCommand("watch-output", {
-    description: "Show recent output from a watch process",
-    getArgumentCompletions: (prefix) => {
-      const items = [...processes.values()]
-        .filter((p) => !p.exited)
-        .map((p) => ({
-          value: p.id,
-          label: p.name ? `${p.id} (${p.name})` : p.id,
-        }));
-      if (prefix) {
-        return items.filter(
-          (i) =>
-            i.value.startsWith(prefix) ||
-            i.label.toLowerCase().includes(prefix.toLowerCase()),
-        );
-      }
-      return items.length > 0 ? items : null;
-    },
-    handler: async (args, ctx) => {
-      const parts = args.trim().split(/\s+/);
-      if (parts.length === 0 || parts[0] === "") {
-        ctx.ui.notify(
-          "Usage: /watch-output <process> [--since <seq|seconds>] [--limit <n>]",
-          "error",
-        );
-        return;
-      }
-
-      const ref = parts[0];
-
-      let sinceSeq: number | undefined;
-      let sinceSecondsAgo: number | undefined;
-      let limit = 50;
-
-      for (let i = 1; i < parts.length; i++) {
-        if (parts[i] === "--since" && i + 1 < parts.length) {
-          const val = parts[i + 1];
-          if (val.endsWith("s")) {
-            sinceSecondsAgo = parseInt(val.slice(0, -1), 10);
-          } else {
-            sinceSeq = parseInt(val, 10);
-          }
-          i++;
-        } else if (parts[i] === "--limit" && i + 1 < parts.length) {
-          limit = parseInt(parts[i + 1], 10);
-          i++;
-        }
-      }
-
-      const result = actionOutput({
-        process: ref,
-        since_seq: sinceSeq,
-        since_seconds_ago: sinceSecondsAgo,
-        limit,
-      });
-
-      if (!result.ok) {
-        ctx.ui.notify(result.error, "error");
-      } else if (result.value.empty) {
-        ctx.ui.notify("(no output)", "info");
-      } else {
-        ctx.ui.setWidget(`watch-output-${result.value.process.id}`, [result.value.lines], {
-          placement: "belowEditor",
-        });
-      }
-    },
-  });
-
-  pi.registerCommand("watch-wait", {
-    description:
-      "Wait for new output from a watch process (optionally matching a substring)",
-    getArgumentCompletions: (prefix) => {
-      const items = [...processes.values()]
-        .filter((p) => !p.exited)
-        .map((p) => ({
-          value: p.id,
-          label: p.name ? `${p.id} (${p.name})` : p.id,
-        }));
-      if (prefix) {
-        return items.filter(
-          (i) =>
-            i.value.startsWith(prefix) ||
-            i.label.toLowerCase().includes(prefix.toLowerCase()),
-        );
-      }
-      return items.length > 0 ? items : null;
-    },
-    handler: async (args, ctx) => {
-      const parts = args.trim().split(/\s+/);
-      if (parts.length === 0 || parts[0] === "") {
-        ctx.ui.notify(
-          "Usage: /watch-wait <process> [--match <text>] [--timeout <ms>]",
-          "error",
-        );
-        return;
-      }
-
-      const ref = parts[0];
-
-      let match: string | undefined;
-      let timeout = 15000;
-
-      for (let i = 1; i < parts.length; i++) {
-        if (parts[i] === "--match" && i + 1 < parts.length) {
-          match = parts[i + 1];
-          i++;
-        } else if (parts[i] === "--timeout" && i + 1 < parts.length) {
-          timeout = parseInt(parts[i + 1], 10);
-          i++;
-        }
-      }
-
-      ctx.ui.notify(
-        `Waiting for output${match ? ` matching "${match}"` : ""}...`,
-        "info",
-      );
-
-      const result = await actionWait({
-        process: ref,
-        timeout_ms: timeout,
-        match,
-      });
-
-      if (!result.ok) {
-        ctx.ui.notify(result.error, "error");
-      } else {
-        ctx.ui.setWidget(
-          `watch-wait-${result.value.process.id}`,
-          [result.value.lines],
-          { placement: "belowEditor" },
-        );
-      }
-    },
-  });
-
-  pi.registerCommand("watch-input", {
-    description: "Send text to a watch process's stdin",
-    getArgumentCompletions: (prefix) => {
-      const items = [...processes.values()]
-        .filter((p) => !p.exited)
-        .map((p) => ({
-          value: p.id,
-          label: p.name ? `${p.id} (${p.name})` : p.id,
-        }));
-      if (prefix) {
-        return items.filter(
-          (i) =>
-            i.value.startsWith(prefix) ||
-            i.label.toLowerCase().includes(prefix.toLowerCase()),
-        );
-      }
-      return items.length > 0 ? items : null;
-    },
-    handler: async (args, ctx) => {
-      const parts = args.trim().split(/\s+/);
-      if (parts.length < 2 || parts[0] === "") {
-        ctx.ui.notify("Usage: /watch-input <process> <text>", "error");
-        return;
-      }
-
-      const ref = parts[0];
-      const text = parts.slice(1).join(" ");
-
-      const result = actionInput(ref, text);
-      if (!result.ok) {
-        ctx.ui.notify(result.error, "error");
-      } else {
-        ctx.ui.notify(`Sent to ${result.value.id}: ${text}`, "info");
-      }
-    },
   });
 
   // ─── Tools ─────────────────────────────────────────────────────────────────
@@ -348,9 +115,13 @@ export default function (pi: ExtensionAPI) {
         "Start a long-running CLI process (e.g. tsc --watch, jest --watch) and monitor its output",
       promptGuidelines: [
         "Use watch_start to launch build/test/lint watchers, then watch_wait to block until they finish a cycle.",
-        "Use watch_list to see all running processes, watch_output to poll incremental output, and watch_stop to terminate one.",
+        "Use watch_list to see all running processes, watch_output to poll incremental output, watch_restart to hot-restart one, and watch_stop to terminate one.",
       ],
       parameters: WatchStartSchema,
+      outputSchema: WatchStartOutputSchema,
+      namespace: WATCH_NAMESPACE,
+      annotations: MUTATING,
+      executionMode: "sequential",
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         const result = actionStart({
           command: params.command,
@@ -360,23 +131,13 @@ export default function (pi: ExtensionAPI) {
           bufferSize: params.bufferSize,
         });
 
-        if (!result.ok) {
-          return {
-            content: [{ type: "text" as const, text: `Error: ${result.error}` }],
-            details: {},
-          };
-        }
+        if (!result.ok) return failResult(result.error);
 
         const proc = result.value;
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Started process ${proc.id} (${proc.name ?? proc.command}). PID: ${proc.child?.pid ?? "n/a"}\nCommand: ${proc.command} ${proc.args.join(" ")}\nCWD: ${proc.cwd}`,
-            },
-          ],
-          details: {},
-        };
+        return okResult(
+          `Started process ${proc.id} (${proc.name ?? proc.command}). PID: ${proc.child?.pid ?? "n/a"}\nCommand: ${proc.command} ${proc.args.join(" ")}\nCWD: ${proc.cwd}`,
+          { ok: true, process: toProcessSummary(proc) },
+        );
       },
     }),
   );
@@ -387,24 +148,48 @@ export default function (pi: ExtensionAPI) {
       label: "Watch Stop",
       description: "Stop a running watch process by ID or name.",
       parameters: WatchStopSchema,
+      outputSchema: WatchStopOutputSchema,
+      namespace: WATCH_NAMESPACE,
+      annotations: DESTRUCTIVE,
+      executionMode: "sequential",
       async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
         const result = await actionStop(params.process);
-        if (!result.ok) {
-          return {
-            content: [{ type: "text" as const, text: `Error: ${result.error}` }],
-            details: {},
-          };
-        }
+        if (!result.ok) return failResult(result.error);
+
+        const { process: proc, wasRunning } = result.value;
+        return okResult(
+          `Stopped process ${proc.id} (${proc.name ?? proc.command}).`,
+          { ok: true, process: toProcessSummary(proc), was_running: wasRunning },
+        );
+      },
+    }),
+  );
+
+  pi.registerTool(
+    defineTool({
+      name: "watch_restart",
+      label: "Watch Restart",
+      description:
+        "Hot-restart a watch process: stop and start it again in place, preserving its ID, name, and buffered output. Use after editing a config the watcher reads, or when a watcher is wedged.",
+      promptSnippet:
+        "Hot-restart a watch process in place, keeping its id, name, and output history",
+      promptGuidelines: [
+        "Prefer watch_restart over a stop+start pair when you want to keep the process's id, name, and buffered history.",
+      ],
+      parameters: WatchRestartSchema,
+      outputSchema: WatchRestartOutputSchema,
+      namespace: WATCH_NAMESPACE,
+      annotations: DESTRUCTIVE,
+      executionMode: "sequential",
+      async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+        const result = await actionRestart(params.process);
+        if (!result.ok) return failResult(result.error);
+
         const proc = result.value;
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Stopped process ${proc.id} (${proc.name ?? proc.command}).`,
-            },
-          ],
-          details: {},
-        };
+        return okResult(
+          `Restarted process ${proc.id} (${proc.name ?? proc.command}). PID: ${proc.child?.pid ?? "n/a"}`,
+          { ok: true, process: toProcessSummary(proc) },
+        );
       },
     }),
   );
@@ -415,38 +200,36 @@ export default function (pi: ExtensionAPI) {
       label: "Watch List",
       description: "List all tracked watch processes and their status.",
       parameters: WatchListSchema,
+      outputSchema: WatchListOutputSchema,
+      namespace: WATCH_NAMESPACE,
+      annotations: READ_ONLY,
       async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
         const list = actionList(params.includeCompleted !== false);
-
-        if (list.length === 0) {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: "No watch processes running. Use watch_start to launch one.",
-              },
-            ],
-            details: {},
-          };
-        }
-
         const running = list.filter((p: WatchProcess) => !p.exited).length;
         const stopped = list.filter((p: WatchProcess) => p.exited).length;
+        const structured = {
+          ok: true,
+          processes: list.map(toProcessSummary),
+          running,
+          stopped,
+        };
+
+        if (list.length === 0) {
+          return okResult(
+            "No watch processes running. Use watch_start to launch one.",
+            structured,
+          );
+        }
+
         const suffix =
           stopped > 0
             ? ` (${running} running, ${stopped} stopped)`
             : ` (${running} running)`;
 
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text:
-                list.map(formatProcessSummary).join("\n") + "\n" + suffix,
-            },
-          ],
-          details: {},
-        };
+        return okResult(
+          list.map(formatProcessSummary).join("\n") + "\n" + suffix,
+          structured,
+        );
       },
     }),
   );
@@ -457,23 +240,16 @@ export default function (pi: ExtensionAPI) {
       label: "Watch Status",
       description: "Get detailed status of a specific watch process.",
       parameters: WatchStatusSchema,
+      outputSchema: WatchStatusOutputSchema,
+      namespace: WATCH_NAMESPACE,
+      annotations: READ_ONLY,
       async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
         const result = actionStatus(params.process);
-        if (!result.ok) {
-          return {
-            content: [{ type: "text" as const, text: `Error: ${result.error}` }],
-            details: {},
-          };
-        }
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: formatProcessStatus(result.value),
-            },
-          ],
-          details: {},
-        };
+        if (!result.ok) return failResult(result.error);
+        return okResult(formatProcessStatus(result.value), {
+          ok: true,
+          process: toProcessSummary(result.value),
+        });
       },
     }),
   );
@@ -485,6 +261,9 @@ export default function (pi: ExtensionAPI) {
       description:
         "Get recent output from a watch process. Use since_seq for incremental polling or since_seconds_ago for time-based queries.",
       parameters: WatchOutputSchema,
+      outputSchema: WatchOutputOutputSchema,
+      namespace: WATCH_NAMESPACE,
+      annotations: READ_ONLY,
       async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
         const result = actionOutput({
           process: params.process,
@@ -493,17 +272,19 @@ export default function (pi: ExtensionAPI) {
           limit: params.limit,
           sources: params.sources,
         });
+        if (!result.ok) return failResult(result.error);
 
-        if (!result.ok) {
-          return {
-            content: [{ type: "text" as const, text: `Error: ${result.error}` }],
-            details: {},
-          };
-        }
-        return {
-          content: [{ type: "text" as const, text: result.value.lines }],
-          details: {},
-        };
+        const { process: proc, lines, empty } = result.value;
+        return okResult(
+          empty ? "(no new output)" : lines.map(formatLine).join("\n"),
+          {
+            ok: true,
+            process: toProcessSummary(proc),
+            lines: lines.map(toLineJson),
+            empty,
+            latest_seq: proc.buffer.latestSeq(),
+          },
+        );
       },
     }),
   );
@@ -513,8 +294,11 @@ export default function (pi: ExtensionAPI) {
       name: "watch_wait",
       label: "Watch Wait",
       description:
-        "Block until new output arrives from a watch process, optionally waiting for a specific substring match. Ideal for waiting for a build or test cycle to complete.",
+        "Block until new output arrives from a watch process, optionally waiting for a specific substring or regex match. Ideal for waiting for a build or test cycle to complete.",
       parameters: WatchWaitSchema,
+      outputSchema: WatchWaitOutputSchema,
+      namespace: WATCH_NAMESPACE,
+      annotations: READ_ONLY,
       async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
         const result = await actionWait({
           process: params.process,
@@ -526,17 +310,21 @@ export default function (pi: ExtensionAPI) {
           sources: params.sources,
           signal,
         });
+        if (!result.ok) return failResult(result.error);
 
-        if (!result.ok) {
-          return {
-            content: [{ type: "text" as const, text: `Error: ${result.error}` }],
-            details: {},
-          };
-        }
-        return {
-          content: [{ type: "text" as const, text: result.value.lines }],
-          details: {},
-        };
+        const { process: proc, lines, empty, matched, timedOut } = result.value;
+        return okResult(
+          empty ? "(timeout — no new output)" : lines.map(formatLine).join("\n"),
+          {
+            ok: true,
+            process: toProcessSummary(proc),
+            lines: lines.map(toLineJson),
+            empty,
+            latest_seq: proc.buffer.latestSeq(),
+            matched,
+            timed_out: timedOut,
+          },
+        );
       },
     }),
   );
@@ -548,18 +336,20 @@ export default function (pi: ExtensionAPI) {
       description:
         "Send a line of text to a watch process's stdin (e.g. to answer interactive prompts).",
       parameters: WatchInputSchema,
+      outputSchema: WatchInputOutputSchema,
+      namespace: WATCH_NAMESPACE,
+      annotations: MUTATING,
+      executionMode: "sequential",
       async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
         const result = actionInput(params.process, params.text);
-        if (!result.ok) {
-          return {
-            content: [{ type: "text" as const, text: `Error: ${result.error}` }],
-            details: {},
-          };
-        }
-        return {
-          content: [{ type: "text" as const, text: "Input sent." }],
-          details: {},
-        };
+        if (!result.ok) return failResult(result.error);
+
+        const proc = result.value;
+        return okResult("Input sent.", {
+          ok: true,
+          process: toProcessSummary(proc),
+          text: params.text,
+        });
       },
     }),
   );

@@ -11,6 +11,15 @@ export interface BufferedLine {
 
 export type LineSource = BufferedLine["source"];
 
+export interface WaitResult {
+  /** Lines collected while waiting (may include non-matching lines). */
+  lines: BufferedLine[];
+  /** True when the wait resolved because a line matched the filter. */
+  matched: boolean;
+  /** True when the timeout elapsed before a matching line arrived. */
+  timedOut: boolean;
+}
+
 export class RingBuffer {
   private maxLines: number;
   private lines: BufferedLine[] = [];
@@ -75,6 +84,16 @@ export class RingBuffer {
     return this.lines.length;
   }
 
+  /**
+   * Drop all `waitForLine` listeners without touching buffered data.
+   * Used on hot module replacement (extension reload) so waiters from the
+   * previous runtime do not leak into the freshly loaded one while the child
+   * process keeps running.
+   */
+  clearListeners(): void {
+    this.bus.removeAllListeners();
+  }
+
   waitForLine(
     sinceSeq: number,
     timeoutMs: number,
@@ -82,10 +101,11 @@ export class RingBuffer {
     signal?: AbortSignal,
     matchRegex?: string,
     sources?: LineSource[],
-  ): Promise<BufferedLine[]> {
+  ): Promise<WaitResult> {
     const needle = match ? match.toLowerCase() : null;
     const regex = matchRegex ? new RegExp(matchRegex, "i") : null;
 
+    const hasFilter = needle !== null || regex !== null;
     const lineMatches = (l: BufferedLine): boolean => {
       if (needle && !l.text.toLowerCase().includes(needle)) return false;
       if (regex && !regex.test(l.text)) return false;
@@ -97,25 +117,26 @@ export class RingBuffer {
     const existing = this.lines.filter(
       (l) => l.seq > sinceSeq && lineMatches(l),
     );
-    if (existing.length > 0) return Promise.resolve(existing);
+    if (existing.length > 0) {
+      return Promise.resolve({ lines: existing, matched: true, timedOut: false });
+    }
 
     const collected: BufferedLine[] = [];
 
     return new Promise((resolve) => {
-      const timer = setTimeout(() => {
+      const finish = (matched: boolean, timedOut: boolean) => {
         cleanup();
-        resolve(collected);
-      }, timeoutMs);
-
-      const onAbort = () => {
-        cleanup();
-        resolve(collected);
+        resolve({ lines: collected, matched, timedOut });
       };
+
+      const timer = setTimeout(() => finish(false, true), timeoutMs);
+
+      const onAbort = () => finish(false, false);
 
       if (signal) {
         if (signal.aborted) {
           clearTimeout(timer);
-          return resolve(collected);
+          return resolve({ lines: collected, matched: false, timedOut: false });
         }
         signal.addEventListener("abort", onAbort, { once: true });
       }
@@ -123,9 +144,9 @@ export class RingBuffer {
       function handler(entry: BufferedLine) {
         if (entry.seq <= sinceSeq) return;
         collected.push(entry);
-        if (lineMatches(entry)) {
-          cleanup();
-          resolve(collected);
+        // Without an explicit filter, any new line resolves the wait.
+        if (!hasFilter || lineMatches(entry)) {
+          finish(true, false);
         }
       }
 
