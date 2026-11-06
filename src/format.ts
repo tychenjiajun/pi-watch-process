@@ -13,6 +13,8 @@ export type ProcessSummary = {
   uptime_sec: number;
   buffered_lines: number;
   latest_seq: number;
+  /** Read cursor — pass as `since_seq` to fetch only newer lines. */
+  next_seq: number;
   latest_ts: number | null;
 };
 
@@ -44,6 +46,7 @@ export const toProcessSummary = (proc: WatchProcess): ProcessSummary => ({
   uptime_sec: frozenUptime(proc),
   buffered_lines: proc.buffer.length(),
   latest_seq: proc.buffer.latestSeq(),
+  next_seq: proc.cursor,
   latest_ts: proc.buffer.latestTs() ?? null,
 });
 

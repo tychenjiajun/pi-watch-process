@@ -62,17 +62,26 @@ async function main() {
     assert.equal(typeof proc.child?.pid, "number");
   });
 
-  // ── wait for a known line ───────────────────────────────────────────────────
+  // ── wait for a line buffered *before* the call ──────────────────────────────
+  // Regression: the default read position must be the process read cursor, not
+  // the latest seq, so a cycle that already finished matches instead of timing
+  // out (the common watch_start → watch_wait pattern).
+  await sleep(400);
+  const waitedAt = Date.now();
   const waited = await actionWait({
     process: proc.id,
-    match: "build start",
-    timeout_ms: 3000,
+    match: "Found 0 errors",
+    timeout_ms: 1500,
   });
-  check("wait matches startup output", () => {
+  check("wait matches output buffered before the call (default cursor)", () => {
     assert.equal(waited.ok, true);
     assert.equal(waited.value.matched, true);
     assert.equal(waited.value.timedOut, false);
-    assert.ok(waited.value.lines.some((l) => l.text.includes("build start")));
+    assert.ok(
+      Date.now() - waitedAt < 1000,
+      "buffered match should resolve immediately, not wait for the timeout",
+    );
+    assert.ok(waited.value.lines.some((l) => l.text.includes("Found 0 errors")));
   });
 
   await sleep(300);
@@ -82,6 +91,15 @@ async function main() {
     assert.ok(out.value.lines.length > 0);
     assert.ok(out.value.lines.every((l) => l.seq > 0 && l.ts > 0));
     assert.ok(out.value.lines.some((l) => l.text.includes("tick")));
+  });
+
+  check("output exposes a chaining read cursor", () => {
+    assert.equal(typeof out.value.nextSeq, "number");
+    assert.equal(toProcessSummary(proc).next_seq, out.value.nextSeq);
+    assert.ok(
+      out.value.nextSeq >= (out.value.lines.at(-1)?.seq ?? 0),
+      "cursor must cover every returned line",
+    );
   });
 
   // ── stdin ───────────────────────────────────────────────────────────────────

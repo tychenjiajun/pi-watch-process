@@ -63,6 +63,7 @@ export function actionStart(params: {
     startTime: 0,
     stopTime: 0,
     buffer: new RingBuffer(bufferSize),
+    cursor: 0,
   };
 
   processes.set(id, proc);
@@ -144,6 +145,36 @@ export interface OutputSlice {
   empty: boolean;
   lines: BufferedLine[];
   process: WatchProcess;
+  /** Read cursor after this call — pass as `since_seq` to fetch only newer lines. */
+  nextSeq: number;
+}
+
+/**
+ * Resolve the effective `since_seq` for a read.
+ *
+ * - explicit `since_seq` wins;
+ * - `since_seconds_ago` maps to the first line inside that window (falling back
+ *   to the latest seq when the window is empty, so a wait blocks for new output);
+ * - otherwise the process read cursor is used, so already-buffered lines are
+ *   included instead of skipped.
+ */
+function resolveSinceSeq(
+  proc: WatchProcess,
+  params: { since_seq?: number; since_seconds_ago?: number },
+): number {
+  if (params.since_seq !== undefined) return params.since_seq;
+  if (params.since_seconds_ago !== undefined && params.since_seconds_ago > 0) {
+    const seq = proc.buffer.firstSeqSince(params.since_seconds_ago);
+    return seq !== undefined ? seq : proc.buffer.latestSeq();
+  }
+  return proc.cursor;
+}
+
+/** Advance the read cursor past every line the caller has now seen. */
+function advanceCursor(proc: WatchProcess, lines: BufferedLine[]): void {
+  for (const line of lines) {
+    if (line.seq > proc.cursor) proc.cursor = line.seq;
+  }
 }
 
 export function actionOutput(params: {
@@ -162,15 +193,21 @@ export function actionOutput(params: {
   }
 
   const slice = proc.buffer.getLines(
-    params.since_seq,
+    resolveSinceSeq(proc, params),
     params.since_seconds_ago,
     params.limit,
     params.sources,
   );
+  advanceCursor(proc, slice);
 
   return {
     ok: true,
-    value: { empty: slice.length === 0, lines: slice, process: proc },
+    value: {
+      empty: slice.length === 0,
+      lines: slice,
+      process: proc,
+      nextSeq: proc.cursor,
+    },
   };
 }
 
@@ -198,17 +235,7 @@ export async function actionWait(params: {
   }
 
   const timeout = Math.min(params.timeout_ms ?? 15000, MAX_WAIT_TIMEOUT_MS);
-  const sinceSeq = params.since_seq ?? proc.buffer.latestSeq();
-
-  // If since_seconds_ago is provided, compute the equivalent seq
-  // by finding the first line with ts >= cutoff in the full buffer
-  let effectiveSinceSeq = sinceSeq;
-  if (params.since_seconds_ago !== undefined && params.since_seconds_ago > 0) {
-    const seq = proc.buffer.firstSeqSince(params.since_seconds_ago);
-    if (seq !== undefined) {
-      effectiveSinceSeq = seq;
-    }
-  }
+  const effectiveSinceSeq = resolveSinceSeq(proc, params);
 
   // Validate matchRegex before passing to waitForLine
   if (params.matchRegex) {
@@ -231,12 +258,15 @@ export async function actionWait(params: {
     params.sources,
   );
 
+  advanceCursor(proc, result.lines);
+
   return {
     ok: true,
     value: {
       empty: result.lines.length === 0,
       lines: result.lines,
       process: proc,
+      nextSeq: proc.cursor,
       matched: result.matched,
       timedOut: result.timedOut,
     },

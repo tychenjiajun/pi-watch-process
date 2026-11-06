@@ -37,9 +37,13 @@ Once loaded, 8 tools are available to the LLM and to codemode scripts.
 | `watch_restart` | Hot-restart in place (keeps ID, name, history) | `{process}` |
 | `watch_list` | List all tracked processes | `{includeCompleted?}` |
 | `watch_status` | Detailed status of one process | `{process}` |
-| `watch_output` | Get recent output | `{process, since_seq?, since_seconds_ago?, limit?, sources?}` |
-| `watch_wait` | Block until new output/match | `{process, since_seq?, since_seconds_ago?, timeout_ms?, match?, matchRegex?, sources?}` |
+| `watch_output` | Get recent output (unread lines by default) | `{process, since_seq?, since_seconds_ago?, limit?, sources?}` |
+| `watch_wait` | Block until output arrives or a match is found | `{process, since_seq?, since_seconds_ago?, timeout_ms?, match?, matchRegex?, sources?}` |
 | `watch_input` | Send text to stdin | `{process, text}` |
+
+`watch_output` and `watch_wait` default to the process **read cursor**, so they
+include output buffered before the call instead of skipping it. Both return
+`next_seq`; pass it back as `since_seq` to read only newer lines.
 
 ### Example workflow
 
@@ -61,6 +65,15 @@ Once loaded, 8 tools are available to the LLM and to codemode scripts.
 ```jsonc
 { "name": "watch_output", "arguments": { "process": "tsc", "since_seq": 42, "limit": 50 } }
 ```
+
+Omit `since_seq` to read from the process read cursor (unread lines); the result
+carries `next_seq` for the next call. `watch_wait` uses the same default, so a
+cycle that already finished (e.g. right after `watch_start`) matches immediately
+instead of timing out.
+
+> **Vitest v3/v4:** when spawned without a TTY, `vitest` runs once and exits.
+> Pass `--watch` explicitly (`args: ["vitest", "--watch", "<filter>"]`) so the
+> watcher stays alive.
 
 **4. Hot-restart after editing a watched config:**
 

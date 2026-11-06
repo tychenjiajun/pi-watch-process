@@ -115,6 +115,7 @@ export default function (pi: ExtensionAPI) {
         "Start a long-running CLI process (e.g. tsc --watch, jest --watch) and monitor its output",
       promptGuidelines: [
         "Use watch_start to launch build/test/lint watchers, then watch_wait to block until they finish a cycle.",
+        "watch_output/watch_wait default to the process read cursor, so they include output buffered before the call; pass since_seq (or the returned next_seq) to read only newer lines.",
         "Use watch_list to see all running processes, watch_output to poll incremental output, watch_restart to hot-restart one, and watch_stop to terminate one.",
       ],
       parameters: WatchStartSchema,
@@ -259,7 +260,7 @@ export default function (pi: ExtensionAPI) {
       name: "watch_output",
       label: "Watch Output",
       description:
-        "Get recent output from a watch process. Use since_seq for incremental polling or since_seconds_ago for time-based queries.",
+        "Get recent output from a watch process. Omit since_seq to read unread lines (defaults to the process read cursor); pass since_seq/next_seq for incremental polling or since_seconds_ago for time-based queries.",
       parameters: WatchOutputSchema,
       outputSchema: WatchOutputOutputSchema,
       namespace: WATCH_NAMESPACE,
@@ -283,6 +284,7 @@ export default function (pi: ExtensionAPI) {
             lines: lines.map(toLineJson),
             empty,
             latest_seq: proc.buffer.latestSeq(),
+            next_seq: result.value.nextSeq,
           },
         );
       },
@@ -294,7 +296,7 @@ export default function (pi: ExtensionAPI) {
       name: "watch_wait",
       label: "Watch Wait",
       description:
-        "Block until new output arrives from a watch process, optionally waiting for a specific substring or regex match. Ideal for waiting for a build or test cycle to complete.",
+        "Block until output arrives from a watch process, optionally waiting for a specific substring or regex match. Ideal for waiting for a build or test cycle to complete. The default read position is the process read cursor, so a cycle that already finished (e.g. right after watch_start) matches immediately instead of timing out.",
       parameters: WatchWaitSchema,
       outputSchema: WatchWaitOutputSchema,
       namespace: WATCH_NAMESPACE,
@@ -321,6 +323,7 @@ export default function (pi: ExtensionAPI) {
             lines: lines.map(toLineJson),
             empty,
             latest_seq: proc.buffer.latestSeq(),
+            next_seq: result.value.nextSeq,
             matched,
             timed_out: timedOut,
           },

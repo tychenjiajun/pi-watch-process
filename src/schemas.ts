@@ -3,7 +3,10 @@ import { Type, type TSchema } from "@sinclair/typebox";
 // ─── Shared fragments ────────────────────────────────────────────────────────
 
 export const SinceSeq = Type.Optional(
-  Type.Number({ description: "Only return lines with seq > this value" }),
+  Type.Number({
+    description:
+      "Only return lines with seq > this value. Omit to read from the process read cursor (unread lines), which includes output buffered before the call.",
+  }),
 );
 
 export const SinceSecondsAgo = Type.Optional(
@@ -144,6 +147,7 @@ export const ProcessSummarySchema = Type.Object({
   uptime_sec: Type.Number(),
   buffered_lines: Type.Number(),
   latest_seq: Type.Number(),
+  next_seq: Type.Number(),
   latest_ts: Type.Union([Type.Number(), Type.Null()]),
 });
 
@@ -165,6 +169,7 @@ export const LineSliceSchema = Type.Object({
   lines: Type.Array(BufferedLineSchema),
   empty: Type.Boolean(),
   latest_seq: Type.Number(),
+  next_seq: Type.Number(),
 });
 
 const ErrorOutputSchema = Type.Object({
@@ -198,6 +203,7 @@ export const WatchWaitOutputSchema = ok(
     lines: Type.Array(BufferedLineSchema),
     empty: Type.Boolean(),
     latest_seq: Type.Number(),
+    next_seq: Type.Number(),
     matched: Type.Boolean(),
     timed_out: Type.Boolean(),
   }),

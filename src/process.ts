@@ -17,6 +17,14 @@ export interface WatchProcess {
   startTime: number; // Date.now() when started
   stopTime: number; // Date.now() when exited (0 while running)
   buffer: RingBuffer;
+  /**
+   * Read cursor: highest seq a caller has consumed so far. `watch_output` and
+   * `watch_wait` use this as their default `since_seq`, so output that arrived
+   * before the call is not silently skipped. This is what lets the common
+   * `watch_start` → `watch_wait(match)` pattern resolve immediately instead of
+   * timing out when the watched cycle already finished.
+   */
+  cursor: number;
 }
 
 // ─── Process registry ────────────────────────────────────────────────────────
